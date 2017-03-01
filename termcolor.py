@@ -1,0 +1,3 @@
+TERM_RED = "\033[31m"
+TERM_WHITE = "\033[37m"
+TERM_RESET = "\033[00m"
