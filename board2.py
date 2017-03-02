@@ -1,6 +1,7 @@
 # https://jeffbradberry.com/posts/2015/09/intro-to-monte-carlo-tree-search/
 import itertools
-
+import functools
+from djikstra import djikstra
 
 PIECE_FLAT = 1
 PIECE_WALL = 2
@@ -12,11 +13,7 @@ piece_names = {
 	PIECE_CAP: 'C'
 }
 
-def get_color(piece):
-	if piece == 0: return 0
-	if piece < 0: return -1
-	return 1
-
+@functools.lru_cache(maxsize=16, typed=False)
 def sequence_with_sum(n): # all sequences that sum to n. That's pretty nifty eh?
 	if n == 0:
 		yield ()
@@ -26,18 +23,14 @@ def sequence_with_sum(n): # all sequences that sum to n. That's pretty nifty eh?
 			yield s + (x,)
 	return
 
+@functools.lru_cache(maxsize=16, typed=False)
 def sequences_with_sum_below(n):
 	return itertools.chain.from_iterable(map(sequence_with_sum, range(1, n)))
 
-def build_split_table(maxrange, material):
-	# build a split table for a given range and material amount...
-	return filter(lambda seq: len(seq) <= maxrange, sequences_with_sum_below(material + 1))
-
-_split_table = [[list(build_split_table(r, m)) for r in range(1, m + 1)] for m in range(1, 8)]
-def get_splits(material=1, range=1, size=5):
-	material = min(material, size)
+@functools.lru_cache(maxsize=128, typed=False)
+def splits(material, range):
 	range = min(range, material)
-	return _split_table[material-1][range-1]
+	return filter(lambda seq: len(seq) == range, sequences_with_sum_below(material))
 
 # every change made to a board actually copies it effectively...
 class Board:
@@ -84,7 +77,7 @@ class Board:
 			dest += delta
 
 			if usedPieces == 0:
-				stacks[dest] += stacks[fr][-(usedPieces + count):]
+				stacks[dest] += stacks[fr][-count:]
 			else:
 				stacks[dest] += stacks[fr][-(usedPieces + count):-(usedPieces)]
 			usedPieces += count
@@ -101,7 +94,7 @@ class Board:
 
 		if piece < 0:
 			if piece == -PIECE_CAP:
-				self.capstones = (self.capstones[0] - 1, self.capstones[1])
+				self.capstones = (self.capstones[0], self.capstones[1] - 1)
 			else:
 				self.pieces = (self.pieces[0], self.pieces[1] - 1)
 		else:
@@ -142,10 +135,12 @@ class Board:
 					yield ('place', (i, PIECE_FLAT * turn))
 			return
 
-		haveCapstone = (turn > 0 and b.capstones[0]) or (turn < 0 and b.capstones[1])
+		haveCapstone = (turn > 0 and self.capstones[0] > 0) or (turn < 0 and self.capstones[1] > 0)
 		stacks = self.stacks
 		size = self.size
-		for i in range(0, self.squares):
+
+		for x, y in itertools.product(range(0, 5), range(0, 5)):
+			i = self.index(x, y)
 			if len(stacks[i]) == 0:
 				if not placements: continue
 				# placements
@@ -155,63 +150,60 @@ class Board:
 					yield ('place', (i, PIECE_CAP * turn))
 			elif stacks[i][-1] * turn > 0:
 				piece = stacks[i][-1] * turn
-				x = i % 8
-				y = int(i / 8)
-				material = len(stacks[i])
+				material = min(len(stacks[i]), self.size)
+
+				# TODO: check that the split  does not walk over a capstone or wall.
+				#       that is very muchly not allowed and should generally speaking be prevented.
+				#       okay well that was fun.
 				if x > 0:
 					delta = self.index(-1, 0)
-					for split in get_splits(material, x, size=size):
+					for split in split(material, x):
+						landOnIndex = self.index(x - len(split), y)
 						yield ('split', (i, delta, split))
 				if x < size - 1:
 					delta = self.index(1, 0)
-					for split in get_splits(material, size - x - 1, size=size):
+					for split in get_splits(material, size - x - 1):
+						landOnIndex = self.index(x + len(split), y)
 						yield ('split', (i, delta, split))
 				if y > 0:
 					delta = self.index(0 , -1)
-					for split in get_splits(material, y, size=size):
+					for split in splits(material, y):
+						landOnIndex = self.index(x, y - len(split))
 						yield ('split', (i, delta, split))
 				if y < size - 1:
 					delta = self.index(0, 1)
-					for split in get_splits(material, size - y - 1, size=size):
+					for split in splits(material, size - y - 1):
+						landOnIndex = self.index(x, y + len(split))
 						yield ('split', (i, delta, split))
 
+	# returns a list of offsets that do not go off the board from the given coordinate
+	def directions_from_coordinate(x, y):
+		if x > 0:
+			yield -1
+		if x < self.size - 1:
+			yield 1
+		if y > 0:
+			yield -self.size
+		if y < self.size - 1:
+			yield self.size
 
+	# returns the winner if one can be found using a rather simple flood fill implementation
 	def get_winner(self):
-		def sides_connected(mask):
-			size = self.size
-
-			def recursive(flood, x, y):
-				flood[self.index(x, y)] = True
-				if x > 0 and not flood[self.index(x - 1, y)] and mask[self.index(x - 1, y)]:
-					recursive(flood, x - 1, y)
-				if x < size - 1 and not flood[self.index(x + 1, y)] and mask[self.index(x + 1, y)]:
-					recursive(flood, x + 1, y)
-				if y > 0 and not flood[self.index(x, y - 1)] and mask[self.index(x, y - 1)]:
-					recursive(flood, x, y - 1)
-				if y < size - 1 and not flood[self.index(x, y + 1)] and mask[self.index(x, y + 1)]:
-					recursive(flood, x, y + 1)
-
-			floodHor = [False] * self.squares
-			for x in range(0, size):
-				recursive(floodHor, x, 0)
-			for x in range(0, size):
-				if floodHor[self.index(x, size - 1)]: return True
-			floodVrt = [False] * self.squares
-			for y in range(0, size):
-				recursive(floodVrt, 0, y)
-			for y in range(0, size):
-				if floodVrt[self.index(size - 1, x)]: return True
-			return False
-
 		if self.pieces[0] + self.capstones[0] == 0 or self.pieces[1] + self.capstones[1] == 0:
 			return sum(s[-1] == 0 and 0 (s[-1] > 0 and 1 or -1) for s in self.stacks)
 
-		costsWhite = [len(stack) > 0 and stack[-1] > 0 for stack in self.stacks]
-		costsBlack = [len(stack) > 0 and stack[-1] < 0 for stack in self.stacks]
-		if sides_connected(costsWhite):
+		whiteCostsHor = tuple(not (len(s) > 0 and (s[-1] == PIECE_FLAT or s[-1] == PIECE_CAP)) and 1 or 0 for s in self.stacks)
+		whiteCostsVrt = tuple(whiteCostsHor[x + y * self.size] for x, y in itertools.product(range(0, self.size), range(0, self.size)))
+
+		if djikstra(whiteCostsHor, self.size) == 0 or djikstra(whiteCostsVrt, self.size) == 0:
 			return 1
-		elif sides_connected(costsBlack):
+
+		blackCostsHor = tuple(not (len(s) > 0 and (s[-1] == -PIECE_FLAT or s[-1] == -PIECE_CAP)) and 1 or 0 for s in self.stacks)
+		blackCostsVrt = tuple(blackCostsHor[x + y * self.size] for x, y in itertools.product(range(0, self.size), range(0, self.size)))
+
+		if djikstra(blackCostsHor, self.size) == 0 or djikstra(blackCostsVrt, self.size) == 0:
 			return -1
+
 		return 0
 
 	def __hash__(self):
@@ -251,5 +243,3 @@ class Board:
 				board.append("")
 
 		return ",".join(meta) + ";" + ",".join(board)
-
-b = Board().withSize(size=5)
